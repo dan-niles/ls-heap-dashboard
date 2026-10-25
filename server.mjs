@@ -43,10 +43,13 @@ async function appOf(pid) {
 }
 
 async function discover() {
-    const out = await sh("pgrep", ["-f", "ballerina-language-server"]);
+    const out = await sh("pgrep", ["-f", "org.ballerinalang.langserver.launchers.stdio.Main"]);
     const pids = out.split("\n").map(Number).filter(Boolean);
-    return Promise.all(pids.map(async (pid) => {
-        const command = (await sh("ps", ["-o", "command=", "-p", String(pid)])).trim();
+    const procs = await Promise.all(pids.map(async (pid) =>
+        ({ pid, command: (await sh("ps", ["-o", "command=", "-p", String(pid)])).trim() })));
+    // Shells and scripts whose command line merely mentions the main class are not servers.
+    const servers = procs.filter((p) => /(^|\/)java\s/.test(p.command));
+    return Promise.all(servers.map(async ({ pid, command }) => {
         const jar = (command.match(/[^ :]*ballerina-language-server[^ :]*\.jar/) || [""])[0];
         let app = await appOf(pid);
         if (app === "VS Code" && /\/packages\/ballerina-extension\/ls\//.test(jar)) {

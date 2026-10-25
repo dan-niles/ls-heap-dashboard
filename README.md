@@ -19,6 +19,7 @@ No npm install; the page loads Chart.js from cdnjs.
 | Force GC / Auto GC | Runs a full GC (Auto: every 10 s) so retained memory is visible |
 | Breakdown | Live-object counts: workspace projects (real + expression copies), package projects, syntax trees, compiler environments, plus the largest classes |
 | Add Marker | Draws a labelled line on every chart (for example "form opened") |
+| Chart | Two-finger scroll moves through the last 2 hours; "Live" follows the latest samples again |
 
 A full GC pauses the server briefly (well under a second on a ~1 GB heap); avoid Auto GC while
 measuring latency.

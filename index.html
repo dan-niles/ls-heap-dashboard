@@ -47,11 +47,12 @@
   <h1>Language Server Heap</h1>
   <input id="markText" placeholder="Marker, e.g. form opened" size="22">
   <button id="markBtn">Add Marker</button>
-  <span class="hint">Heap used includes garbage. "Force GC" (or Auto GC) shows the live heap: what is really retained.</span>
+  <span class="hint">Heap used includes garbage. "Force GC" (or Auto GC) shows the live heap: what is really retained. Scroll with two fingers to move through time, "Live" to follow again.</span>
 </header>
 <main id="cards"><div class="empty">Looking for running language servers…</div></main>
 <script>
-const WINDOW_MS = 15 * 60 * 1000;
+const KEEP_MS = 2 * 60 * 60 * 1000;
+const VIEW_MS = 5 * 60 * 1000;
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const markers = [];
 const views = new Map();
@@ -73,6 +74,7 @@ const markerPlugin = {
 };
 
 function newView(inst) {
+  const view = { auto: null, follow: true, breakdownOpen: false };
   const el = document.createElement("section");
   el.className = "card";
   el.innerHTML = `
@@ -89,6 +91,7 @@ function newView(inst) {
       <button class="gc">Force GC</button>
       <button class="auto" title="Runs a full GC every 10 s so the live heap is tracked continuously">Auto GC: off</button>
       <button class="bd">Breakdown</button>
+      <button class="live" title="Follow the latest samples again">Live</button>
     </div>
     <div class="breakdown"></div>`;
   document.getElementById("cards").appendChild(el);
@@ -104,13 +107,38 @@ function newView(inst) {
         x: { type: "linear", ticks: { color: css("--muted"), callback: (v) => new Date(v).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), maxTicksLimit: 6 }, grid: { color: css("--border") } },
         y: { beginAtZero: true, ticks: { color: css("--muted"), callback: (v) => v + " MB" }, grid: { color: css("--border") } },
       },
-      plugins: { legend: { display: false }, tooltip: { callbacks: { title: (i) => new Date(i[0].parsed.x).toLocaleTimeString() } } },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { title: (i) => new Date(i[0].parsed.x).toLocaleTimeString() } },
+      },
     },
     plugins: [markerPlugin],
   });
-  const view = { el, chart, auto: null, pid: inst.pid };
+  view.el = el; view.chart = chart; view.pid = inst.pid;
   el.querySelector(".gc").onclick = () => forceGc(view);
-  el.querySelector(".bd").onclick = () => loadBreakdown(view);
+  el.querySelector(".bd").onclick = () => {
+    if (view.breakdownOpen) {
+      view.el.querySelector(".breakdown").innerHTML = "";
+      view.breakdownOpen = false;
+      view.el.querySelector(".bd").textContent = "Breakdown";
+      return;
+    }
+    loadBreakdown(view);
+  };
+  el.querySelector(".live").onclick = () => { view.follow = true; followLatest(view, Date.now()); };
+  // Two-finger scroll (or a mouse wheel) moves through time; the visible span stays the same.
+  el.querySelector("canvas").addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const x = chart.options.scales.x;
+    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    const shift = (delta / chart.chartArea.width) * VIEW_MS;
+    const oldest = chart.data.datasets[0].data[0]?.x ?? Date.now();
+    const max = Math.min(Date.now(), Math.max(oldest + VIEW_MS, x.max + shift));
+    view.follow = max >= Date.now() - 2000;
+    x.min = max - VIEW_MS;
+    x.max = max;
+    chart.update("none");
+  }, { passive: false });
   el.querySelector(".auto").onclick = (e) => {
     if (view.auto) { clearInterval(view.auto); view.auto = null; e.target.textContent = "Auto GC: off"; e.target.classList.remove("on"); return; }
     forceGc(view);
@@ -120,7 +148,13 @@ function newView(inst) {
   return view;
 }
 
-function trim(arr, now) { while (arr.length && arr[0].x < now - WINDOW_MS) arr.shift(); }
+function trim(arr, now) { while (arr.length && arr[0].x < now - KEEP_MS) arr.shift(); }
+
+function followLatest(view, now) {
+  view.chart.options.scales.x.min = now - VIEW_MS;
+  view.chart.options.scales.x.max = now;
+  view.chart.update();
+}
 
 async function forceGc(view) {
   const btn = view.el.querySelector(".gc");
@@ -146,8 +180,9 @@ async function loadBreakdown(view) {
       <table><tr><th>Largest classes</th><th class="n">Objects</th><th class="n">MB</th></tr>
       ${b.top.map((t) => `<tr><td>${t.cls.split(".").pop()}<small style="color:var(--muted)"> ${t.cls.split(".").slice(0, -1).join(".")}</small></td><td class="n">${t.count.toLocaleString()}</td><td class="n">${t.mb}</td></tr>`).join("")}
       </table>
-      <div class="legend">Live total ${b.liveMB} MB at ${new Date(b.at).toLocaleTimeString()} (a full GC runs first)</div>`;
-  } finally { btn.disabled = false; btn.textContent = "Breakdown"; }
+      <div class="legend">Live total ${b.liveMB} MB at ${new Date(b.at).toLocaleTimeString()} (a full GC runs first). Click Breakdown again to close.</div>`;
+    view.breakdownOpen = true;
+  } finally { btn.disabled = false; btn.textContent = view.breakdownOpen ? "Close Breakdown" : "Breakdown"; }
 }
 
 async function poll() {
@@ -169,9 +204,7 @@ async function poll() {
     const used = view.chart.data.datasets[0].data;
     used.push({ x: i.at, y: i.usedMB });
     trim(used, i.at); trim(view.chart.data.datasets[1].data, i.at);
-    view.chart.options.scales.x.min = i.at - WINDOW_MS / 3;
-    view.chart.options.scales.x.max = i.at;
-    view.chart.update();
+    if (view.follow) followLatest(view, i.at); else view.chart.update("none");
   }
   for (const [pid, view] of views) {
     if (!seen.has(pid)) { clearInterval(view.auto); view.el.remove(); views.delete(pid); }
