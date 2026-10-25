@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LS Heap Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #667085; --border: #e3e6ec;
+    --used: #3b82f6; --live: #e11d48; --marker: #a855f7; --ok: #16a34a; --btn: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1218; --card: #171b23; --text: #e6e9ef; --muted: #98a2b3; --border: #2a303b;
+      --used: #60a5fa; --live: #fb7185; --marker: #c084fc; --ok: #4ade80; --btn: #232a35; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, system-ui, sans-serif; }
+  header { padding: 16px 20px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 18px; margin: 0 12px 0 0; }
+  header .hint { color: var(--muted); font-size: 12px; flex: 1 1 300px; }
+  input, button { font: inherit; color: var(--text); background: var(--btn); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button.on { background: var(--ok); color: #fff; border-color: var(--ok); }
+  main { padding: 16px 20px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .title h2 { font-size: 16px; margin: 0; }
+  .title span { color: var(--muted); font-size: 12px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+  .stat { background: var(--bg); border-radius: 8px; padding: 8px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat small { color: var(--muted); }
+  .chart { position: relative; height: 220px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+  td, th { padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: left; }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; grid-column: 1 / -1; }
+  .legend { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 4px 0 10px; vertical-align: -1px; }
+  @media (max-width: 520px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Language Server Heap</h1>
+  <input id="markText" placeholder="Marker, e.g. form opened" size="22">
+  <button id="markBtn">Add Marker</button>
+  <span class="hint">Heap used includes garbage. "Force GC" (or Auto GC) shows the live heap: what is really retained.</span>
+</header>
+<main id="cards"><div class="empty">Looking for running language servers…</div></main>
+<script>
+const WINDOW_MS = 15 * 60 * 1000;
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const markers = [];
+const views = new Map();
+
+const markerPlugin = {
+  id: "markers",
+  afterDatasetsDraw(chart) {
+    const { ctx, chartArea: a, scales: { x } } = chart;
+    ctx.save();
+    ctx.strokeStyle = css("--marker"); ctx.fillStyle = css("--marker"); ctx.font = "11px system-ui";
+    for (const m of markers) {
+      const px = x.getPixelForValue(m.t);
+      if (px < a.left || px > a.right) continue;
+      ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillText(m.label, Math.min(px + 4, a.right - 80), a.top + 12);
+    }
+    ctx.restore();
+  },
+};
+
+function newView(inst) {
+  const el = document.createElement("section");
+  el.className = "card";
+  el.innerHTML = `
+    <div class="title"><h2></h2><span class="meta"></span></div>
+    <div class="stats">
+      <div class="stat"><small>Heap used</small><b class="used">–</b></div>
+      <div class="stat"><small>Live after GC</small><b class="live">–</b></div>
+      <div class="stat"><small>Committed</small><b class="committed">–</b></div>
+      <div class="stat"><small>Process RSS</small><b class="rss">–</b></div>
+    </div>
+    <div class="chart"><canvas></canvas></div>
+    <div class="legend"><i style="background:${css("--used")}"></i>Heap used<i style="background:${css("--live")}"></i>Live after GC<i style="background:${css("--marker")}"></i>Marker</div>
+    <div class="actions">
+      <button class="gc">Force GC</button>
+      <button class="auto" title="Runs a full GC every 10 s so the live heap is tracked continuously">Auto GC: off</button>
+      <button class="bd">Breakdown</button>
+    </div>
+    <div class="breakdown"></div>`;
+  document.getElementById("cards").appendChild(el);
+  const chart = new Chart(el.querySelector("canvas"), {
+    type: "line",
+    data: { datasets: [
+      { label: "Heap used (MB)", data: [], borderColor: css("--used"), backgroundColor: css("--used"), pointRadius: 0, borderWidth: 2, tension: 0.2 },
+      { label: "Live after GC (MB)", data: [], borderColor: css("--live"), backgroundColor: css("--live"), pointRadius: 4, showLine: true, borderWidth: 2, stepped: "before" },
+    ] },
+    options: {
+      animation: false, maintainAspectRatio: false, parsing: false,
+      scales: {
+        x: { type: "linear", ticks: { color: css("--muted"), callback: (v) => new Date(v).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), maxTicksLimit: 6 }, grid: { color: css("--border") } },
+        y: { beginAtZero: true, ticks: { color: css("--muted"), callback: (v) => v + " MB" }, grid: { color: css("--border") } },
+      },
+      plugins: { legend: { display: false }, tooltip: { callbacks: { title: (i) => new Date(i[0].parsed.x).toLocaleTimeString() } } },
+    },
+    plugins: [markerPlugin],
+  });
+  const view = { el, chart, auto: null, pid: inst.pid };
+  el.querySelector(".gc").onclick = () => forceGc(view);
+  el.querySelector(".bd").onclick = () => loadBreakdown(view);
+  el.querySelector(".auto").onclick = (e) => {
+    if (view.auto) { clearInterval(view.auto); view.auto = null; e.target.textContent = "Auto GC: off"; e.target.classList.remove("on"); return; }
+    forceGc(view);
+    view.auto = setInterval(() => forceGc(view), 10000);
+    e.target.textContent = "Auto GC: on"; e.target.classList.add("on");
+  };
+  return view;
+}
+
+function trim(arr, now) { while (arr.length && arr[0].x < now - WINDOW_MS) arr.shift(); }
+
+async function forceGc(view) {
+  const btn = view.el.querySelector(".gc");
+  btn.disabled = true; btn.textContent = "Running GC…";
+  try {
+    const r = await (await fetch(`/api/gc?pid=${view.pid}`)).json();
+    view.chart.data.datasets[1].data.push({ x: r.at, y: r.usedMB });
+    view.chart.data.datasets[0].data.push({ x: r.at, y: r.usedMB });
+    view.el.querySelector(".live").textContent = r.usedMB + " MB";
+    view.chart.update();
+  } finally { btn.disabled = false; btn.textContent = "Force GC"; }
+}
+
+async function loadBreakdown(view) {
+  const btn = view.el.querySelector(".bd");
+  btn.disabled = true; btn.textContent = "Counting live objects…";
+  try {
+    const b = await (await fetch(`/api/breakdown?pid=${view.pid}`)).json();
+    view.el.querySelector(".breakdown").innerHTML = `
+      <table><tr><th>What the server holds (live objects)</th><th class="n">Count</th></tr>
+      ${b.tracked.map((t) => `<tr><td title="${t.cls}">${t.label}</td><td class="n">${t.count.toLocaleString()}</td></tr>`).join("")}
+      </table>
+      <table><tr><th>Largest classes</th><th class="n">Objects</th><th class="n">MB</th></tr>
+      ${b.top.map((t) => `<tr><td>${t.cls.split(".").pop()}<small style="color:var(--muted)"> ${t.cls.split(".").slice(0, -1).join(".")}</small></td><td class="n">${t.count.toLocaleString()}</td><td class="n">${t.mb}</td></tr>`).join("")}
+      </table>
+      <div class="legend">Live total ${b.liveMB} MB at ${new Date(b.at).toLocaleTimeString()} (a full GC runs first)</div>`;
+  } finally { btn.disabled = false; btn.textContent = "Breakdown"; }
+}
+
+async function poll() {
+  let list = [];
+  try { list = await (await fetch("/api/instances")).json(); } catch { return; }
+  const cards = document.getElementById("cards");
+  if (!list.length) { cards.innerHTML = '<div class="empty">No Ballerina language server is running.</div>'; views.clear(); return; }
+  cards.querySelector(".empty")?.remove();
+  const seen = new Set();
+  for (const i of list) {
+    seen.add(i.pid);
+    const view = views.get(i.pid) || newView(i);
+    views.set(i.pid, view);
+    view.el.querySelector("h2").textContent = i.app;
+    view.el.querySelector(".meta").textContent = `PID ${i.pid} · up ${i.uptime} · CPU ${i.cpu}%`;
+    view.el.querySelector(".used").textContent = i.usedMB + " MB";
+    view.el.querySelector(".committed").textContent = i.committedMB + " MB";
+    view.el.querySelector(".rss").textContent = i.rssMB + " MB";
+    const used = view.chart.data.datasets[0].data;
+    used.push({ x: i.at, y: i.usedMB });
+    trim(used, i.at); trim(view.chart.data.datasets[1].data, i.at);
+    view.chart.options.scales.x.min = i.at - WINDOW_MS / 3;
+    view.chart.options.scales.x.max = i.at;
+    view.chart.update();
+  }
+  for (const [pid, view] of views) {
+    if (!seen.has(pid)) { clearInterval(view.auto); view.el.remove(); views.delete(pid); }
+  }
+}
+
+document.getElementById("markBtn").onclick = () => {
+  const input = document.getElementById("markText");
+  markers.push({ t: Date.now(), label: input.value.trim() || "marker" });
+  input.value = "";
+  views.forEach((v) => v.chart.update());
+};
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
